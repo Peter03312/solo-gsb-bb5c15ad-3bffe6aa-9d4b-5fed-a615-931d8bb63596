@@ -11,6 +11,8 @@
 
 此外，机构可把**多个已发布快照一次性交给同一外部审阅者**：operator 用本人凭据提交多快照共享凭证申请（**至少两个互不重复的快照 ID**、可选到期策略与**正整数共享读取总额度**，提交时冻结清单），由**另一名 reviewer** 批准或驳回（申请人不得自审）；批准时**重新核对全部快照仍存在且未撤回**，任一项失效则整次批准失败、不签发凭证（申请仍可驳回）。批准成功后**一次性签发随机共享凭证**，绑定冻结清单并**共用读取额度**：凭证在**现有公开快照读取接口**上只能读取清单内快照的脱敏正文，沿用原响应与模糊 403；清单内某项快照后来撤回，只拒绝该项且**不扣额度**，其他项仍可读；到期、撤销或额度耗尽时全部拒绝。维护人员凭服务密钥可查询凭证清单、额度与状态并撤销。
 
+发现读取凭证（单快照令牌或多快照共享凭证）**疑似泄露**时，维护人员可凭服务密钥向统一换发接口提交**原凭证与请求标识**，换发**新随机凭证**：响应返回新凭证、适用快照、**原绝对到期时刻**与**剩余额度**。仅**未撤销、未到期且额度未耗尽**的凭证可换发；新凭证继承原范围（适用快照/冻结清单）、到期时刻与**已用次数**（额度不重置），旧凭证在换发提交后立即不能再读取。相同原凭证与请求标识重试只返回首次换发结果（幂等，不再次换发）；不同请求标识并发换发同一凭证仅一次成功，其余 `409`。共享清单中个别快照已撤回时仍可换发，该项继续不可读；换发与同时进行的成功读取按事务先后结算，不重置也不超支额度。公开读取响应、模糊 403 与成功扣次规则保持不变。
+
 签发快照读取令牌时可**可选**地设置正整数**读取次数上限**（`max_reads`）：直接发布在请求时确定，受控发布在提交申请时冻结、批准签发后生效。公开读取沿用既有脱敏正文响应，每次凭有效令牌**成功读取**消耗一次；无效、撤销、到期、快照已撤回、令牌与快照不匹配或已达上限的请求不消耗次数。
 
 - 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16
@@ -81,6 +83,7 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | `GET` | `/read-bundles` | 服务密钥 | 列出全部已签发共享凭证：清单、额度、状态（不含原文） |
 | `GET` | `/read-bundles/{bundle_id}` | 服务密钥 | 查询单个共享凭证的清单、`max_reads`/`reads_used`/`remaining_reads` 与状态 |
 | `POST` | `/read-bundles/{bundle_id}/revoke` | 服务密钥 | 撤销共享凭证（撤销后全部读取 403） |
+| `POST` | `/credentials/rotate` | 服务密钥 | **泄露换发**：提交原凭证 + 请求标识，单快照令牌/多快照共享凭证统一换发为新随机凭证 |
 | `GET` | `/public/snapshots/{snapshot_id}?token=...` | 无（凭令牌或共享凭证） | 公开读取脱敏正文（单快照令牌与多快照共享凭证同一入口） |
 | `GET` | `/healthz` | 无 | 健康检查 |
 
@@ -367,6 +370,86 @@ curl -sS -X POST http://localhost:8000/read-bundles/<BID>/revoke \
 | 清单少于两个、含重复 ID、`max_reads` 非正整数、到期时间非法、两种到期方式同传 | `422` |
 | 凭证读取清单外快照、凭证无效/撤销/到期/额度耗尽、快照已撤回 | 公开侧统一 `403 snapshot unavailable` |
 
+## 读取凭证泄露换发（单快照令牌 / 多快照共享凭证统一入口）
+
+机构发现某枚读取凭证**疑似泄露**（例如令牌或共享凭证出现在不受控渠道）时，可凭服务密钥把它**换发**为一枚新随机凭证，旧凭证随即失效。**单快照读取令牌与多快照共享凭证使用同一个接口**，服务端自动识别凭证类型并返回对应内容。
+
+### 流程与规则
+
+1. **换发（服务密钥）**：`POST /credentials/rotate`，请求头带 `X-Service-Key`，请求体：
+   - `credential`：**原凭证**（发布/批准时签发的随机令牌或共享凭证字符串，非空白）；
+   - `request_id`：**请求标识**（调用方生成，建议 UUID，非空白，最长 200 字符）。
+2. **换发资格**：仅**未撤销、未到期且额度未耗尽**的凭证可换发；否则返回 `409`（`detail.reason` 为 `revoked` / `expired` / `quota_exhausted` / `already_rotated`）。快照本身是否已撤回**不影响**换发资格。
+3. **继承语义**：新凭证继承原凭证的
+   - **范围**：单快照令牌仍绑定同一快照；共享凭证复制同一份**冻结清单**（顺序不变）；
+   - **原绝对到期时刻**（`expires_at`，不延长、不重置；相对到期策略在首次签发时已换算为绝对时刻）；
+   - **已用次数**（`reads_used`，只增不减，不因换发重置），因此响应里的**剩余额度**为 `max_reads - reads_used`；单快照令牌不限次时 `max_reads`/`remaining_reads` 为 `null`。
+4. **旧凭证立即失效**：换发提交后，旧凭证在公开读取接口一律沿用模糊 `403 snapshot unavailable`，且这些失败请求**不消耗次数**；旧凭证的 `reads_used` 停在换发时刻。新凭证在同一入口 `GET /public/snapshots/{snapshot_id}?token=...` 使用，公开响应结构、模糊 403 与成功扣次规则完全不变。
+5. **幂等**：相同（原凭证, 请求标识）重试（例如网络超时后重发）**原样返回首次换发结果**（同一枚新凭证、同一 `rotated_at`，并带 `"replayed": true`），**不会再次换发**。首次成功响应不含 `replayed`（即 `false`）。
+6. **并发唯一**：同一原凭证以**不同**请求标识并发或重复换发时，数据库行锁串行化，**仅一次成功**，落选请求返回 `409`（`reason: "already_rotated"`）。
+7. **与读取并发的结算**：换发按“先快照行、再凭证行”加锁，与公开读取的加锁顺序一致，换发与同时进行的成功读取**按事务先后结算**——换发提交前已获锁的成功读取计入旧凭证并被新凭证**继承**，换发提交后开始的读取用旧凭证一律 403；成功总次数绝不超过原上限（**不超支、不重置**），两者不会死锁。
+8. **撤回的清单快照**：共享凭证冻结清单中**个别快照已撤回时仍可换发**，新凭证复制该清单后，**该项继续不可读**（读它仍 403 且不扣共享额度），其他项继续可读；响应 `items` 中逐项给出当前 `status`（`published` / `withdrawn`）。
+9. **链式换发**：换发出的新凭证自身也是普通凭证，可再次凭（新凭证, 新请求标识）继续换发；前几代凭证均不可再读。
+
+### 状态码约定（换发接口）
+
+| 场景 | 状态码 |
+| --- | --- |
+| 缺少/错误服务密钥 | `401` |
+| `credential` 或 `request_id` 缺失、空白或超长 | `422` |
+| 原凭证既不是单快照令牌也不是共享凭证 | `404`（`credential not found`） |
+| 已撤销 / 已到期 / 额度耗尽；不同请求标识对同一原凭证再次换发 | `409` |
+| 相同（原凭证, 请求标识）重试 | `200`（幂等回放，`replayed: true`） |
+
+> 换发不改变维护侧既有能力：旧凭证仍可查询（`GET /tokens/{token}`、`GET /read-bundles/{id}`，返回非空 `rotated_at`、`active=false`），也仍可调用撤销接口（幂等）。
+
+### 调用示例
+
+```bash
+# 1. 怀疑令牌泄露：凭服务密钥提交原令牌与请求标识换发
+curl -sS -X POST http://localhost:8000/credentials/rotate \
+  -H "X-Service-Key: dev-service-key-change-me" \
+  -H "Content-Type: application/json" \
+  -d '{"credential": "<原令牌TOKEN>", "request_id": "req-20261001-0001"}'
+# 单快照令牌 =>
+# {"kind":"token","request_id":"req-20261001-0001",
+#  "old_credential":"<原令牌TOKEN>","new_credential":"<新令牌NEW>",
+#  "snapshot_ids":["<SID>"],"expires_at":"2026-10-01T12:00:00Z",
+#  "max_reads":5,"reads_used":2,"remaining_reads":3,
+#  "rotated_at":"2026-10-01T05:00:00Z","replayed":false,"items":null}
+
+# 2. 旧令牌立即失效；新令牌在同一公开接口继续使用，沿用剩余额度
+curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<原令牌TOKEN>"
+# => 403 {"detail":"snapshot unavailable"}（不计数）
+curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<新令牌NEW>"
+# => 200 脱敏正文（继承已用 2 次，仅剩 3 次）
+
+# 3. 相同（原凭证, 请求标识）重试：原样回放首次结果，不再次换发
+curl -sS -X POST http://localhost:8000/credentials/rotate \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"credential": "<原令牌TOKEN>", "request_id": "req-20261001-0001"}'
+# => 同一枚 new_credential，"replayed":true，rotated_at 与首次一致
+
+# 4. 换发共享凭证：同样的请求体，响应 kind=bundle 并带冻结清单逐项状态
+curl -sS -X POST http://localhost:8000/credentials/rotate \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"credential": "<原共享凭证CRED>", "request_id": "req-bundle-1"}'
+# => {"kind":"bundle", "new_credential":"<新共享凭证>", "snapshot_ids":["<SID1>","<SID2>"],
+#     "max_reads":5,"reads_used":2,"remaining_reads":3,"expires_at":null,
+#     "items":[{"snapshot_id":"<SID1>","status":"published",...},
+#              {"snapshot_id":"<SID2>","status":"withdrawn","withdrawn_at":"...",...}]}
+# 清单内已撤回的 <SID2> 继续不可读、读取不扣额度；<SID1> 继续可读
+
+# 5. 不可换发的情况：已撤销 / 已到期 / 额度耗尽 / 已被换发（不同请求标识）=> 409
+# => 409 {"detail":{"message":"credential is not eligible for rotation","reason":"expired"}}
+```
+
+完整端到端演示（含 401/404/422/409、幂等回放、并发仅一次成功、继承到期/已用/剩余、撤回清单单项继续不可读、与读取并发结算不超支）：
+
+```bash
+./examples/demo_rotate.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
+```
+
 ## 设计要点
 
 - **不可变快照**：发布时把脱敏结果写入 `snapshots`（按 `(record_id, version)` 唯一），公开读取只访问快照；后续修订写入新版本，旧快照不变。
@@ -397,6 +480,12 @@ curl -sS -X POST http://localhost:8000/read-bundles/<BID>/revoke \
   - 公开读取沿用快照行锁先判定撤回，再把“凭证有效 + 快照在清单内（`EXISTS` 子查询命中 `read_bundle_items`）+ 未撤销 + 未到期 + `reads_used < max_reads`”与共享计数递增合并为**同一条条件 `UPDATE`**：行锁串行化跨快照并发读取，成功总次数绝不超过共享上限；清单外/失效/到期/撤销/耗尽均不命中因而不扣额度，统一模糊 `403`；
   - 清单内某快照撤回只在该快照的行锁阶段拒绝该项、不触碰共享计数，其他清单项不受影响；撤销凭证是独立的原子条件 `UPDATE`，提交后优先生效；
   - 共享凭证与单快照令牌是**两套独立计数与命名空间**：公开接口先按单快照令牌原子判定，未命中再按共享凭证判定，故既有令牌的响应、计数与 `/tokens` 查询行为完全不变。
+- **读取凭证泄露换发**：
+  - 新表 `credential_rotations`（`kind` 区分 token/bundle、原/新凭证、请求标识、首次响应快照 JSONB）随 `create_all` 幂等创建；`read_tokens` 与 `read_bundles` 各幂等补列 `rotated_at`（既有凭证默认空、继续可读）；
+  - 换发在**同一事务**内：先按快照行（令牌为其快照；共享凭证按冻结清单全部快照、按 ID 排序）`FOR UPDATE` 加锁，再对凭证行 `FOR UPDATE` 加锁并以 `populate_existing()` 读取锁等待后的最新已提交版本——锁序与公开读取的“快照行锁 → 条件 UPDATE”一致，换发与读取**串行化而不死锁**，按事务先后结算已用次数；
+  - 新凭证复制原范围（同快照 / 同冻结清单同顺序）、原 `expires_at`、`max_reads` 与 `reads_used`，旧凭证置 `rotated_at` 后提交即不能再读；公开读取的两条条件 `UPDATE` 均增加 `rotated_at IS NULL`，旧凭证的失败读取不计数；
+  - `(old_credential, request_id)` 唯一约束保证相同请求重试幂等：命中既有换发记录即回放保存的首次响应（`replayed=true`），不生成新凭证；不同请求标识的并发换发在凭证行锁后看到非空 `rotated_at`，仅一次成功、其余 `409`；
+  - 资格（未撤销/未到期/额度未耗尽）在凭证行锁内按锁后最新值判定，换发与读取并发时不会重复扣次或超支；共享清单内已撤回快照不阻止换发（不重新核对清单），该项按既有规则继续 403 且不扣额度。
 
 ## 本地开发
 
@@ -421,10 +510,10 @@ python3 -m unittest tests.test_integration_api -v
 
 ```
 app/
-  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、多快照共享凭证申请-复核与共用额度）
-  models.py     # records / record_versions / snapshots(含撤回字段) / read_tokens / publish_requests / read_bundles(+requests/items)
+  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、多快照共享凭证申请-复核与共用额度、凭证泄露换发）
+  models.py     # records / record_versions / snapshots(含撤回字段) / read_tokens / publish_requests / read_bundles(+requests/items) / credential_rotations
   redaction.py  # 区间校验、合并、替换（纯函数）
-  schemas.py    # 请求/响应模型（含撤回、max_reads 与多快照共享凭证模型）
+  schemas.py    # 请求/响应模型（含撤回、max_reads、多快照共享凭证与泄露换发模型）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
   config.py     # 环境变量配置（含 REVIEW_CREDENTIALS 校验）
   db.py         # 引擎与会话
@@ -433,9 +522,10 @@ examples/
   demo_controlled.sh  # 受控发布（申请-复核）端到端调用示例
   demo_withdraw.sh    # 快照永久撤回端到端调用示例
   demo_bundles.sh     # 多快照共享凭证（申请-复核 + 共用额度）端到端调用示例
+  demo_rotate.sh      # 读取凭证泄露换发（令牌/共享凭证统一入口）端到端调用示例
 tests/
   test_redaction.py       # 脱敏逻辑单元测试
   test_config.py          # 操作者凭据配置校验单元测试
-  test_integration_api.py # 受控/共享凭证/既有接口端到端集成测试（真实 PostgreSQL）
+  test_integration_api.py # 受控/共享凭证/换发/既有接口端到端集成测试（真实 PostgreSQL）
 Dockerfile / docker-compose.yml
 ```

@@ -1589,5 +1589,490 @@ class ReadBundleIntegrationTests(unittest.TestCase):
             return session.get(SnapshotModel, snapshot_id).record_id
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class CredentialRotationIntegrationTests(unittest.TestCase):
+    """读取凭证泄露换发：单快照令牌与多快照共享凭证统一入口。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    # ---- 工具方法 ----
+
+    def _create_record_publish(self, max_reads=None, extra=None):
+        body = {"text": TEXT_V1, "intervals": INTERVALS_V1}
+        r = self.client.post("/records", headers=SERVICE_HEADERS, json=body)
+        self.assertEqual(r.status_code, 201, r.text)
+        rid = r.json()["record_id"]
+        pub_body = {"version": 1}
+        if max_reads is not None:
+            pub_body["max_reads"] = max_reads
+        if extra:
+            pub_body.update(extra)
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json=pub_body
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return rid, r.json()
+
+    def _read(self, sid, credential, expected=200):
+        r = self.client.get(f"/public/snapshots/{sid}?token={credential}")
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _rotate(self, credential, request_id, expected=200):
+        r = self.client.post(
+            "/credentials/rotate",
+            headers=SERVICE_HEADERS,
+            json={"credential": credential, "request_id": request_id},
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    # ---- 鉴权与校验 ----
+
+    def test_rotate_requires_service_key(self):
+        rid, pub = self._create_record_publish()
+        r = self.client.post(
+            "/credentials/rotate",
+            json={"credential": pub["token"], "request_id": "req-1"},
+        )
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post(
+            "/credentials/rotate",
+            headers={"X-Service-Key": "wrong"},
+            json={"credential": pub["token"], "request_id": "req-1"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_rotate_unknown_credential_404(self):
+        r = self.client.post(
+            "/credentials/rotate",
+            headers=SERVICE_HEADERS,
+            json={"credential": "definitely-not-a-credential", "request_id": "r1"},
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"], "credential not found")
+
+    def test_rotate_blank_fields_422(self):
+        rid, pub = self._create_record_publish()
+        for body in (
+            {"credential": "", "request_id": "r1"},
+            {"credential": "  ", "request_id": "r1"},
+            {"credential": pub["token"], "request_id": ""},
+            {"credential": pub["token"], "request_id": "   "},
+        ):
+            r = self.client.post(
+                "/credentials/rotate", headers=SERVICE_HEADERS, json=body
+            )
+            self.assertEqual(r.status_code, 422, r.text)
+
+    # ---- 单快照令牌换发 ----
+
+    def test_token_rotation_issues_new_and_invalidates_old(self):
+        rid, pub = self._create_record_publish()
+        sid, old = pub["snapshot_id"], pub["token"]
+        result = self._rotate(old, "req-token-1").json()
+        self.assertEqual(result["kind"], "token")
+        self.assertEqual(result["request_id"], "req-token-1")
+        self.assertEqual(result["old_credential"], old)
+        self.assertNotEqual(result["new_credential"], old)
+        self.assertEqual(result["snapshot_ids"], [sid])
+        self.assertIsNone(result["expires_at"])
+        self.assertIsNone(result["max_reads"])
+        self.assertEqual(result["reads_used"], 0)
+        self.assertIsNone(result["remaining_reads"])
+        self.assertFalse(result["replayed"])
+        self.assertIsNone(result["items"])
+        self.assertIsNotNone(result["rotated_at"])
+        new = result["new_credential"]
+        # 旧令牌换发提交后不能再读取（模糊 403，不泄露原因）
+        self._read(sid, old, expected=403)
+        r = self.client.get(f"/tokens/{old}", headers=SERVICE_HEADERS)
+        self.assertFalse(r.json()["active"])
+        self.assertIsNotNone(r.json()["rotated_at"])
+        # 新令牌在同一快照继续可读
+        self._read(sid, new, expected=200)
+        r = self.client.get(f"/tokens/{new}", headers=SERVICE_HEADERS)
+        self.assertTrue(r.json()["active"])
+        self.assertIsNone(r.json()["rotated_at"])
+
+    def test_token_rotation_inherits_expiry_cap_and_used_count(self):
+        rid, pub = self._create_record_publish(
+            max_reads=5, extra={"expires_in_seconds": 3600}
+        )
+        sid, old = pub["snapshot_id"], pub["token"]
+        self._read(sid, old)
+        self._read(sid, old)
+        old_status = self.client.get(f"/tokens/{old}", headers=SERVICE_HEADERS).json()
+        result = self._rotate(old, "req-inherit").json()
+        # 原绝对到期时刻被继承（不延长）
+        self.assertEqual(result["expires_at"], old_status["expires_at"])
+        self.assertEqual(result["max_reads"], 5)
+        self.assertEqual(result["reads_used"], 2)
+        self.assertEqual(result["remaining_reads"], 3)
+        new = result["new_credential"]
+        # 新令牌沿用继承的计数：再读 3 次后耗尽
+        for _ in range(3):
+            self.assertEqual(self._read(sid, new).status_code, 200)
+        for _ in range(2):
+            self.assertEqual(self._read(sid, new, expected=403).status_code, 403)
+        status_body = self.client.get(f"/tokens/{new}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(status_body["reads_used"], 5)
+        self.assertEqual(status_body["remaining_reads"], 0)
+        # 旧令牌继续不可读，计数停在换发时的 2（旧令牌失败读取不计数）
+        old_status = self.client.get(f"/tokens/{old}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(old_status["reads_used"], 2)
+
+    def test_rotation_idempotent_for_same_request_id(self):
+        rid, pub = self._create_record_publish(max_reads=4)
+        sid, old = pub["snapshot_id"], pub["token"]
+        first = self._rotate(old, "idem-req").json()
+        # 换发后再用旧凭证成功读取是不可能的；直接重试（相同原凭证 + 请求标识）
+        second = self._rotate(old, "idem-req").json()
+        third = self._rotate(old, "idem-req").json()
+        for body in (second, third):
+            self.assertTrue(body["replayed"])
+            self.assertEqual(body["new_credential"], first["new_credential"])
+            self.assertEqual(body["rotated_at"], first["rotated_at"])
+            self.assertEqual(body["reads_used"], first["reads_used"])
+        self.assertFalse(first["replayed"])
+        # 只产生一枚新凭证
+        self._read(sid, first["new_credential"], expected=200)
+        self._read(sid, second["new_credential"], expected=200)
+
+    def test_different_request_id_after_rotation_conflicts(self):
+        rid, pub = self._create_record_publish()
+        old = pub["token"]
+        self._rotate(old, "req-A")
+        # 不同请求标识再次换发同一原凭证 -> 409，不签出新凭证
+        r = self._rotate(old, "req-B", expected=409)
+        self.assertEqual(r.json()["detail"]["reason"], "already_rotated")
+
+    def test_concurrent_rotations_with_distinct_request_ids_succeed_once(self):
+        results: list = []
+        for attempt in range(5):
+            rid, pub = self._create_record_publish(max_reads=20)
+            old = pub["token"]
+            barrier = threading.Barrier(8)
+
+            def rotate(req_suffix):
+                barrier.wait()
+                client = TestClient(app_main.app)
+                r = client.post(
+                    "/credentials/rotate",
+                    headers=SERVICE_HEADERS,
+                    json={"credential": old, "request_id": f"conc-{req_suffix}"},
+                )
+                results.append(r.status_code)
+
+            threads = [
+                threading.Thread(target=rotate, args=(f"req-{i}",)) for i in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            batch = results[-8:]
+            self.assertEqual(batch.count(200), 1, batch)
+            self.assertEqual(batch.count(409), 7, batch)
+
+    def test_revoked_expired_and_exhausted_credentials_cannot_rotate(self):
+        # 已撤销
+        rid, pub = self._create_record_publish()
+        r = self.client.post(
+            f"/tokens/{pub['token']}/revoke", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, 200)
+        r = self._rotate(pub["token"], "r-revoked", expected=409)
+        self.assertEqual(r.json()["detail"]["reason"], "revoked")
+        # 额度耗尽
+        rid, pub = self._create_record_publish(max_reads=1)
+        sid, tok = pub["snapshot_id"], pub["token"]
+        self._read(sid, tok)
+        r = self._rotate(tok, "r-exhausted", expected=409)
+        self.assertEqual(r.json()["detail"]["reason"], "quota_exhausted")
+        # 已到期
+        rid, pub = self._create_record_publish(
+            max_reads=5, extra={"expires_in_seconds": 1}
+        )
+        import time as _time
+
+        _time.sleep(1.2)
+        r = self._rotate(pub["token"], "r-expired", expected=409)
+        self.assertEqual(r.json()["detail"]["reason"], "expired")
+
+    def test_rotation_settles_with_concurrent_reads_without_overspend(self):
+        rid, pub = self._create_record_publish(max_reads=10)
+        sid, old = pub["snapshot_id"], pub["token"]
+        read_codes: list[int] = []
+        barrier = threading.Barrier(9)
+
+        def rotate():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            client.post(
+                "/credentials/rotate",
+                headers=SERVICE_HEADERS,
+                json={"credential": old, "request_id": "req-race"},
+            )
+
+        def read_old():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            read_codes.append(
+                client.get(f"/public/snapshots/{sid}?token={old}").status_code
+            )
+
+        threads = [threading.Thread(target=rotate)]
+        threads += [threading.Thread(target=read_old) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 换发与读取按事务先后结算：部分读取在换发前成功（200），其余 403
+        self.assertTrue(all(c in (200, 403) for c in read_codes), read_codes)
+        self.assertIn(403, read_codes)
+        result = self._rotate(old, "req-race").json()  # 幂等回放
+        new = result["new_credential"]
+        # 新凭证继承已用次数：并发阶段对旧凭证的成功次数
+        inherited = read_codes.count(200)
+        self.assertEqual(result["reads_used"], inherited)
+        self.assertEqual(result["remaining_reads"], 10 - inherited)
+        # 新凭证只能再成功 (10 - inherited) 次，成功总数绝不超过上限
+        for _ in range(10 - inherited):
+            self.assertEqual(self._read(sid, new).status_code, 200)
+        self.assertEqual(self._read(sid, new, expected=403).status_code, 403)
+        status_body = self.client.get(f"/tokens/{new}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(status_body["reads_used"], 10)
+
+    def test_rotated_token_can_be_rotated_again(self):
+        rid, pub = self._create_record_publish(max_reads=7)
+        sid, tok1 = pub["snapshot_id"], pub["token"]
+        self._read(sid, tok1)
+        tok2 = self._rotate(tok1, "chain-1").json()["new_credential"]
+        self._read(sid, tok2)
+        result = self._rotate(tok2, "chain-2").json()
+        tok3 = result["new_credential"]
+        self.assertNotIn(tok3, (tok1, tok2))
+        self.assertEqual(result["reads_used"], 2)
+        self.assertEqual(result["remaining_reads"], 5)
+        # 前两代都不可读，最新凭证可读
+        self._read(sid, tok1, expected=403)
+        self._read(sid, tok2, expected=403)
+        self._read(sid, tok3, expected=200)
+
+    def test_token_on_withdrawn_snapshot_can_still_rotate_but_unreadable(self):
+        rid, pub = self._create_record_publish(max_reads=5)
+        sid, old = pub["snapshot_id"], pub["token"]
+        self._read(sid, old)
+        r = self.client.post(
+            f"/snapshots/{sid}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "误发撤回"},
+        )
+        self.assertEqual(r.status_code, 200)
+        # 快照撤回不作为换发障碍
+        result = self._rotate(old, "req-withdrawn").json()
+        self.assertEqual(result["snapshot_ids"], [sid])
+        self.assertEqual(result["remaining_reads"], 4)
+        # 但新旧令牌对该快照都读不到正文（模糊 403，不计数）
+        self._read(sid, old, expected=403)
+        self._read(sid, result["new_credential"], expected=403)
+        status_body = self.client.get(
+            f"/tokens/{result['new_credential']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 1)
+
+    # ---- 多快照共享凭证换发 ----
+
+    def _approved_bundle(self, snapshot_ids, max_reads=5, extra=None):
+        body = {"snapshot_ids": snapshot_ids, "max_reads": max_reads}
+        if extra:
+            body.update(extra)
+        r = self.client.post("/bundle-requests", auth=BASIC_ALICE, json=body)
+        self.assertEqual(r.status_code, 201, r.text)
+        request_id = r.json()["request_id"]
+        r = self.client.post(
+            f"/bundle-requests/{request_id}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _two_snapshots(self):
+        sids = []
+        for text_, intervals in (
+            (TEXT_V1, INTERVALS_V1),
+            (TEXT_V2, [{"start": 9, "end": 15}]),
+        ):
+            r = self.client.post(
+                "/records",
+                headers=SERVICE_HEADERS,
+                json={"text": text_, "intervals": intervals},
+            )
+            rid = r.json()["record_id"]
+            r = self.client.post(
+                f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+            )
+            sids.append(r.json()["snapshot_id"])
+        return sids
+
+    def test_bundle_rotation_copies_list_and_inherits_quota(self):
+        sids = self._two_snapshots()
+        approved = self._approved_bundle(sids, max_reads=5)
+        old = approved["credential"]
+        self._read(sids[0], old)
+        self._read(sids[1], old)
+        result = self._rotate(old, "bundle-req-1").json()
+        self.assertEqual(result["kind"], "bundle")
+        self.assertEqual(result["snapshot_ids"], sids)
+        self.assertEqual(result["max_reads"], 5)
+        self.assertEqual(result["reads_used"], 2)
+        self.assertEqual(result["remaining_reads"], 3)
+        self.assertIsNone(result["expires_at"])
+        self.assertIsNotNone(result["items"])
+        self.assertEqual([i["snapshot_id"] for i in result["items"]], sids)
+        self.assertEqual([i["position"] for i in result["items"]], [0, 1])
+        self.assertTrue(all(i["status"] == "published" for i in result["items"]))
+        new = result["new_credential"]
+        # 旧凭证失效，新凭证继承清单与剩余额度
+        self._read(sids[0], old, expected=403)
+        for _ in range(3):
+            self.assertEqual(self._read(sids[0], new).status_code, 200)
+        for sid in sids:
+            self.assertEqual(self._read(sid, new, expected=403).status_code, 403)
+        # 维护侧：旧凭证 active=false 且带 rotated_at；新凭证计数继承
+        bid = approved["bundle_id"]
+        old_status = self.client.get(
+            f"/read-bundles/{bid}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertFalse(old_status["active"])
+        self.assertIsNotNone(old_status["rotated_at"])
+        new_status = self.client.get("/read-bundles", headers=SERVICE_HEADERS).json()
+        new_row = next(b for b in new_status["bundles"] if b["credential"] == new)
+        self.assertEqual(new_row["reads_used"], 5)
+        self.assertFalse(new_row["active"])  # 继承额度已用尽
+        self.assertEqual(new_row["remaining_reads"], 0)
+
+    def test_bundle_rotation_with_withdrawn_item_keeps_item_unreadable(self):
+        sids = self._two_snapshots()
+        approved = self._approved_bundle(sids, max_reads=5)
+        old = approved["credential"]
+        # 撤回清单第二项后换发：仍可换发，该项继续不可读且不扣额度
+        r = self.client.post(
+            f"/snapshots/{sids[1]}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "该项撤回"},
+        )
+        self.assertEqual(r.status_code, 200)
+        result = self._rotate(old, "bundle-withdrawn-item").json()
+        items = result["items"]
+        self.assertEqual(items[0]["status"], "published")
+        self.assertEqual(items[1]["status"], "withdrawn")
+        self.assertIsNotNone(items[1]["withdrawn_at"])
+        new = result["new_credential"]
+        self._read(sids[1], new, expected=403)
+        self._read(sids[1], new, expected=403)
+        self._read(sids[0], new, expected=200)
+        # 撤回项不扣额度：仅消耗 1 次
+        bid = next(
+            b["bundle_id"]
+            for b in self.client.get("/read-bundles", headers=SERVICE_HEADERS).json()[
+                "bundles"
+            ]
+            if b["credential"] == new
+        )
+        status_body = self.client.get(
+            f"/read-bundles/{bid}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 1)
+        self.assertEqual(status_body["remaining_reads"], 4)
+
+    def test_bundle_rotation_idempotent_and_conflict(self):
+        sids = self._two_snapshots()
+        approved = self._approved_bundle(sids, max_reads=3)
+        old = approved["credential"]
+        first = self._rotate(old, "b-idem").json()
+        second = self._rotate(old, "b-idem").json()
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["new_credential"], first["new_credential"])
+        # 不同请求标识 -> 409
+        r = self._rotate(old, "b-other", expected=409)
+        self.assertEqual(r.json()["detail"]["reason"], "already_rotated")
+
+    def test_existing_db_gets_rotation_columns(self):
+        from sqlalchemy import inspect, text
+
+        from app.db import engine
+
+        rid, pub = self._create_record_publish()
+        token = pub["token"]
+        sids = self._two_snapshots()
+        approved = self._approved_bundle(sids, max_reads=3)
+        credential = approved["credential"]
+
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE read_tokens DROP COLUMN rotated_at"))
+            conn.execute(text("DROP TABLE credential_rotations"))
+            conn.execute(text("ALTER TABLE read_bundles DROP COLUMN rotated_at"))
+        app_main._init_db_with_retry()
+        token_columns = {c["name"] for c in inspect(engine).get_columns("read_tokens")}
+        bundle_columns = {c["name"] for c in inspect(engine).get_columns("read_bundles")}
+        self.assertIn("rotated_at", token_columns)
+        self.assertIn("rotated_at", bundle_columns)
+        self.assertIn(
+            "credential_rotations", inspect(engine).get_table_names()
+        )
+        # 既有凭证补列后继续可读，且仍可正常换发
+        self.assertEqual(
+            self._read(pub["snapshot_id"], token).status_code, 200
+        )
+        result = self._rotate(credential, "migration-bundle").json()
+        self.assertEqual(result["snapshot_ids"], sids)
+        self.assertEqual(result["remaining_reads"], 3)
+
+    def test_bundle_rotation_concurrent_once_and_inherits_expiry(self):
+        sids = self._two_snapshots()
+        approved = self._approved_bundle(sids, max_reads=8, extra={"expires_in_seconds": 3600})
+        old = approved["credential"]
+        old_status = self.client.get(
+            f"/read-bundles/{approved['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        responses = []
+        barrier = threading.Barrier(6)
+
+        def rotate(suffix):
+            barrier.wait()
+            client = TestClient(app_main.app)
+            responses.append(
+                client.post(
+                    "/credentials/rotate",
+                    headers=SERVICE_HEADERS,
+                    json={"credential": old, "request_id": f"bc-{suffix}"},
+                )
+            )
+
+        threads = [threading.Thread(target=rotate, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        statuses = [r.status_code for r in responses]
+        self.assertEqual(statuses.count(200), 1, statuses)
+        self.assertEqual(statuses.count(409), 5, statuses)
+        winner = next(r for r in responses if r.status_code == 200).json()
+        # 相同（原凭证, 赢家请求标识）重试：幂等回放，不再次换发
+        replay = self._rotate(old, winner["request_id"]).json()
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["new_credential"], winner["new_credential"])
+        self.assertEqual(replay["expires_at"], old_status["expires_at"])
+
+
 if __name__ == "__main__":
     unittest.main()

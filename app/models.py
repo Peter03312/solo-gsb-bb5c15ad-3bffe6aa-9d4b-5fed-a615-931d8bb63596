@@ -112,6 +112,11 @@ class ReadToken(Base):
     max_reads: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 已成功读取次数；由条件 UPDATE 原子递增，保证并发读取不超过上限
     reads_used: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # 换发时间：非空表示该令牌已在“泄露换发”中被新令牌替换，此后旧令牌不能再读取
+    # （到期时刻、范围与已用次数由换发出的新令牌继承，计数不因换发重置）。
+    rotated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 # 受控发布申请的终态
@@ -269,6 +274,11 @@ class ReadBundle(Base):
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 换发时间：非空表示该共享凭证已被新共享凭证替换，旧凭证此后不能再读取
+    # （冻结清单、到期时刻与已用额度由新凭证继承）。
+    rotated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # 绑定的清单（批准时按冻结清单一次性写入），按提交顺序排列
     items: Mapped[list["ReadBundleItem"]] = relationship(
@@ -299,3 +309,46 @@ class ReadBundleItem(Base):
     position: Mapped[int] = mapped_column(Integer, nullable=False)
 
     bundle: Mapped["ReadBundle"] = relationship(back_populates="items")
+
+
+# 泄露换发的凭证类型：单快照令牌 / 多快照共享凭证
+ROTATION_KIND_TOKEN = "token"
+ROTATION_KIND_BUNDLE = "bundle"
+ROTATION_KINDS = (ROTATION_KIND_TOKEN, ROTATION_KIND_BUNDLE)
+
+
+class CredentialRotation(Base):
+    """读取凭证泄露换发记录（单快照令牌与多快照共享凭证统一入口）。
+
+    维护人员凭服务密钥提交（原凭证, 请求标识）换发：
+    - 仅未撤销、未到期且额度未耗尽的凭证可换发；
+    - 同一原凭证只能换发一次：旧凭证换发提交后即失效（rotated_at），
+      新凭证继承原范围（快照/冻结清单）、原绝对到期时刻与已用次数；
+    - (old_credential, request_id) 唯一：相同凭证与请求标识的重试幂等，
+      原样返回首次换发结果（response_payload），不再次换发；
+    - 不同请求标识并发换发同一凭证时，对凭证行的 FOR UPDATE 串行化，
+      仅一次成功，其余看到旧凭证已换发 -> 409。
+    """
+
+    __tablename__ = "credential_rotations"
+    __table_args__ = (
+        UniqueConstraint(
+            "old_credential", "request_id", name="uq_credential_rotations_old_request"
+        ),
+        CheckConstraint(
+            "kind IN ('token', 'bundle')", name="ck_credential_rotations_kind"
+        ),
+        Index("ix_credential_rotations_new_credential", "new_credential"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    old_credential: Mapped[str] = mapped_column(String(64), nullable=False)
+    new_credential: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 调用方提供的请求标识：与原凭证组合构成幂等键
+    request_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    # 首次换发的完整响应（JSONB）：重试时原样回放，绝不再次换发
+    response_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

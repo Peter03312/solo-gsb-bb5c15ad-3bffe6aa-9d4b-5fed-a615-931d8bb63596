@@ -2,8 +2,6 @@ from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
-
-
 class Interval(BaseModel):
     """左闭右开 [start, end)，按 Unicode 码点计。"""
 
@@ -107,6 +105,8 @@ class TokenStatusResponse(BaseModel):
     created_at: datetime
     expires_at: datetime | None
     revoked_at: datetime | None
+    # 非空表示该令牌已在泄露换发中被替换，此后旧令牌不能再读取
+    rotated_at: datetime | None = None
     # null 表示不限次；此时 remaining_reads 也为 null
     max_reads: int | None
     reads_used: int
@@ -261,6 +261,8 @@ class ReadBundleStatusResponse(BaseModel):
     created_at: datetime
     expires_at: datetime | None
     revoked_at: datetime | None
+    # 非空表示该共享凭证已在泄露换发中被替换，旧凭证此后不能再读取
+    rotated_at: datetime | None = None
     items: list[BundleItemInfo]
 
 
@@ -272,3 +274,63 @@ class BundleRevokeResponse(BaseModel):
     bundle_id: UUID
     revoked: bool
     already_revoked: bool
+
+
+# ---- 读取凭证泄露换发（单快照令牌 / 多快照共享凭证统一入口） ----
+
+
+class CredentialRotateRequest(BaseModel):
+    """换发请求：维护人员凭服务密钥提交原凭证与请求标识。
+
+    请求标识由调用方生成（建议 UUID）：与原凭证组合构成幂等键，
+    相同原凭证 + 相同请求标识的重试只回放首次换发结果，不再次换发；
+    同一原凭证使用不同请求标识并发/重复换发仅一次成功，其余 409。
+    """
+
+    credential: str = Field(min_length=1, max_length=64)
+    request_id: str = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def _no_blank_values(self):
+        if not self.credential.strip() or not self.request_id.strip():
+            raise ValueError("credential and request_id must not be blank")
+        return self
+
+
+class RotationBundleItem(BaseModel):
+    """换发响应中的清单项：沿用冻结顺序，并带当前维护状态。"""
+
+    snapshot_id: UUID
+    record_id: UUID
+    version: int
+    position: int
+    status: str
+    withdrawn_at: datetime | None = None
+
+
+class CredentialRotationResponse(BaseModel):
+    """换发结果：单快照令牌与多快照共享凭证共用同一结构。
+
+    kind 为 token 时使用 snapshot_ids（单项）；kind 为 bundle 时
+    snapshot_ids 为冻结清单全部快照，items 带逐项状态（撤回项继续不可读）。
+    新凭证继承原范围、原绝对到期时刻与已用次数；剩余额度按换发时已用次数结算。
+    """
+
+    kind: str
+    request_id: str
+    new_credential: str
+    old_credential: str
+    # 适用快照：单快照令牌为单元素；共享凭证为冻结清单（顺序不变）
+    snapshot_ids: list[UUID]
+    # 原绝对到期时刻（继承，不延长、不重置）；null 表示永不到期
+    expires_at: datetime | None
+    # 原读取上限（继承）；null 表示单快照令牌不限次（共享凭证恒为正整数）
+    max_reads: int | None
+    # 换发时已成功读取次数（继承自原凭证，不重置）
+    reads_used: int
+    # 换发时剩余额度：max_reads 为 null 时为 null
+    remaining_reads: int | None
+    rotated_at: datetime
+    replayed: bool = False
+    # 仅共享凭证：冻结清单逐项当前状态；单快照令牌不返回
+    items: list[RotationBundleItem] | None = None

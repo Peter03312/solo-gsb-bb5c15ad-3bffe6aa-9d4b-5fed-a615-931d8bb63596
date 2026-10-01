@@ -19,6 +19,7 @@ from .models import (
     REQUEST_APPROVED,
     REQUEST_PENDING,
     REQUEST_REJECTED,
+    CredentialRotation,
     PublishRequest as PublishRequestModel,
     ReadBundle,
     ReadBundleItem,
@@ -26,6 +27,8 @@ from .models import (
     ReadToken,
     Record,
     RecordVersion,
+    ROTATION_KIND_BUNDLE,
+    ROTATION_KIND_TOKEN,
     Snapshot,
 )
 from .redaction import IntervalOutOfBoundsError, redact_text, validate_intervals
@@ -41,6 +44,8 @@ from .schemas import (
     ControlledFlagResponse,
     ControlledPublishRequest,
     ControlledSubmitResponse,
+    CredentialRotateRequest,
+    CredentialRotationResponse,
     Interval,
     PublicSnapshotResponse,
     PublishRequest as PublishPayload,
@@ -55,6 +60,7 @@ from .schemas import (
     RecordStatusResponse,
     ReviewRejectRequest,
     RevokeResponse,
+    RotationBundleItem,
     SnapshotInfo,
     SnapshotWithdrawRequest,
     SnapshotWithdrawResponse,
@@ -118,6 +124,16 @@ def _apply_lightweight_migrations() -> None:
             statements.append(
                 "ALTER TABLE read_tokens ADD COLUMN reads_used INTEGER NOT NULL DEFAULT 0"
             )
+        if "rotated_at" not in token_columns:
+            # 既有令牌未经过换发，保持可读
+            statements.append("ALTER TABLE read_tokens ADD COLUMN rotated_at TIMESTAMP")
+    if "read_bundles" in inspector.get_table_names():
+        bundle_columns = {
+            column["name"] for column in inspector.get_columns("read_bundles")
+        }
+        if "rotated_at" not in bundle_columns:
+            # 既有共享凭证未经过换发，保持可读
+            statements.append("ALTER TABLE read_bundles ADD COLUMN rotated_at TIMESTAMP")
     if "publish_requests" in inspector.get_table_names():
         request_columns = {
             column["name"] for column in inspector.get_columns("publish_requests")
@@ -152,8 +168,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.4.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证）",
+    version="1.5.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发）",
     lifespan=lifespan,
 )
 
@@ -243,8 +259,8 @@ def _bundle_request_info(request: ReadBundleRequest) -> BundleRequestInfo:
 
 
 def _bundle_active(bundle: ReadBundle, now: datetime) -> bool:
-    """凭证是否仍可成功读取：未撤销、未到期且共享额度未耗尽。"""
-    if bundle.revoked_at is not None:
+    """凭证是否仍可成功读取：未撤销、未换发、未到期且共享额度未耗尽。"""
+    if bundle.revoked_at is not None or bundle.rotated_at is not None:
         return False
     if bundle.expires_at is not None and bundle.expires_at <= now:
         return False
@@ -277,6 +293,7 @@ def _bundle_status_response(
         created_at=bundle.created_at,
         expires_at=bundle.expires_at,
         revoked_at=bundle.revoked_at,
+        rotated_at=bundle.rotated_at,
         items=items,
     )
 
@@ -1012,6 +1029,284 @@ def _load_bundle_snapshots(
     return {snapshot.id: snapshot for snapshot in snapshots}
 
 
+# ---- 读取凭证泄露换发（单快照令牌 / 多快照共享凭证统一入口） ----
+
+
+def _rotation_conflict(reason: str) -> None:
+    """换发资格不满足或并发落选：统一 409，不把可换发凭证换成新凭证。"""
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"message": "credential is not eligible for rotation", "reason": reason},
+    )
+
+
+def _rotation_payload(
+    *,
+    kind: str,
+    request_id: str,
+    old_credential: str,
+    new_credential: str,
+    snapshot_ids: list[UUID],
+    expires_at: datetime | None,
+    max_reads: int | None,
+    reads_used: int,
+    rotated_at: datetime,
+    items: list[RotationBundleItem] | None = None,
+) -> CredentialRotationResponse:
+    """组装换发响应：剩余额度按换发时已用次数结算（不限次时为 null）。"""
+    remaining = None if max_reads is None else max(max_reads - reads_used, 0)
+    return CredentialRotationResponse(
+        kind=kind,
+        request_id=request_id,
+        old_credential=old_credential,
+        new_credential=new_credential,
+        snapshot_ids=snapshot_ids,
+        expires_at=expires_at,
+        max_reads=max_reads,
+        reads_used=reads_used,
+        remaining_reads=remaining,
+        rotated_at=rotated_at,
+        items=items,
+    )
+
+
+def _replay_rotation(record: CredentialRotation) -> CredentialRotationResponse:
+    """相同（原凭证, 请求标识）重试：原样回放首次换发结果，不再次换发。"""
+    response = CredentialRotationResponse.model_validate(record.response_payload)
+    response.replayed = True
+    return response
+
+
+def _rotate_token(
+    db: Session, snapshot_id: UUID, request_id: str, old_credential: str
+) -> CredentialRotationResponse:
+    """单快照令牌换发：新令牌继承快照范围、原绝对到期时刻与已用次数。"""
+    # 锁序与公开读取一致：先快照行、再凭证行，避免与并发读取形成死锁；
+    # 换发等待快照锁期间，先提交的读取按既有规则计入旧令牌并被新令牌继承。
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
+    ).scalar_one_or_none()
+    read_token = db.execute(
+        select(ReadToken)
+        .where(ReadToken.token == old_credential)
+        .with_for_update()
+        # 锁可能在队列中等待并发读取/换发提交：必须刷新为当前已提交版本，
+        # 否则会读到定位阶段缓存的旧 rotated_at/reads_used（identity map）。
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+    prior = db.execute(
+        select(CredentialRotation).where(
+            CredentialRotation.old_credential == old_credential,
+            CredentialRotation.request_id == request_id,
+        )
+    ).scalar_one_or_none()
+    if prior is not None:
+        db.rollback()
+        return _replay_rotation(prior)
+
+    # 仅未撤销、未换发、未到期且额度未耗尽的凭证可换发。
+    # 快照是否已撤回不作为换发条件（撤回快照的令牌仍可换发，只是继续读不到正文）。
+    if read_token.revoked_at is not None:
+        _rotation_conflict("revoked")
+    if read_token.rotated_at is not None:
+        # 不同请求标识对同一原凭证的换发：仅一次成功，落选方在此冲突
+        _rotation_conflict("already_rotated")
+    now = datetime.now(timezone.utc)
+    if read_token.expires_at is not None and read_token.expires_at <= now:
+        _rotation_conflict("expired")
+    if (
+        read_token.max_reads is not None
+        and read_token.reads_used >= read_token.max_reads
+    ):
+        _rotation_conflict("quota_exhausted")
+
+    rotated_at = now
+    new_token = ReadToken(
+        token=secrets.token_urlsafe(32),
+        snapshot_id=read_token.snapshot_id,
+        expires_at=read_token.expires_at,  # 继承原绝对到期时刻，不延长
+        max_reads=read_token.max_reads,
+        reads_used=read_token.reads_used,  # 继承已用次数，不重置
+    )
+    db.add(new_token)
+    db.flush()
+    read_token.rotated_at = rotated_at  # 旧令牌换发提交后不能再读取
+    payload = _rotation_payload(
+        kind=ROTATION_KIND_TOKEN,
+        request_id=request_id,
+        old_credential=old_credential,
+        new_credential=new_token.token,
+        snapshot_ids=[read_token.snapshot_id],
+        expires_at=read_token.expires_at,
+        max_reads=read_token.max_reads,
+        reads_used=read_token.reads_used,
+        rotated_at=rotated_at,
+    )
+    db.add(
+        CredentialRotation(
+            kind=ROTATION_KIND_TOKEN,
+            old_credential=old_credential,
+            new_credential=new_token.token,
+            request_id=request_id,
+            response_payload=payload.model_dump(mode="json"),
+        )
+    )
+    db.commit()
+    return payload
+
+
+def _rotate_bundle(
+    db: Session, bundle_id: UUID, request_id: str, old_credential: str
+) -> CredentialRotationResponse:
+    """多快照共享凭证换发：新凭证继承冻结清单、原到期时刻与已用共享额度。
+
+    清单中个别快照已撤回时仍可换发：新凭证复制冻结清单，撤回项继续不可读、
+    读取该项仍不扣共享额度，其他项继续可读。
+    """
+    frozen_items = (
+        db.execute(
+            select(ReadBundleItem)
+            .where(ReadBundleItem.bundle_id == bundle_id)
+            .order_by(ReadBundleItem.position)
+        )
+        .scalars()
+        .all()
+    )
+    snapshot_ids = [item.snapshot_id for item in frozen_items]
+    # 先按清单快照行加锁（排序保证加锁顺序一致），再锁凭证行：
+    # 与公开读取的“快照行锁 → 共享额度条件 UPDATE”同序，串行化而不死锁。
+    snapshots = (
+        db.execute(
+            select(Snapshot)
+            .where(Snapshot.id.in_(snapshot_ids))
+            .order_by(Snapshot.id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {snapshot.id: snapshot for snapshot in snapshots}
+    bundle = db.execute(
+        select(ReadBundle)
+        .where(ReadBundle.id == bundle_id)
+        .with_for_update()
+        # 获得行锁后刷新为当前已提交版本（等待锁期间可能有读取扣次或换发完成）
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+    prior = db.execute(
+        select(CredentialRotation).where(
+            CredentialRotation.old_credential == old_credential,
+            CredentialRotation.request_id == request_id,
+        )
+    ).scalar_one_or_none()
+    if prior is not None:
+        db.rollback()
+        return _replay_rotation(prior)
+
+    if bundle.revoked_at is not None:
+        _rotation_conflict("revoked")
+    if bundle.rotated_at is not None:
+        _rotation_conflict("already_rotated")
+    now = datetime.now(timezone.utc)
+    if bundle.expires_at is not None and bundle.expires_at <= now:
+        _rotation_conflict("expired")
+    if bundle.reads_used >= bundle.max_reads:
+        _rotation_conflict("quota_exhausted")
+
+    rotated_at = now
+    new_bundle = ReadBundle(
+        credential=secrets.token_urlsafe(32),
+        max_reads=bundle.max_reads,
+        reads_used=bundle.reads_used,  # 继承已用共享额度，不重置
+        expires_at=bundle.expires_at,  # 继承原绝对到期时刻
+    )
+    db.add(new_bundle)
+    db.flush()
+    for item in frozen_items:
+        db.add(
+            ReadBundleItem(
+                bundle_id=new_bundle.id,
+                snapshot_id=item.snapshot_id,
+                position=item.position,
+            )
+        )
+    bundle.rotated_at = rotated_at
+    response_items = [
+        RotationBundleItem(
+            snapshot_id=item.snapshot_id,
+            record_id=by_id[item.snapshot_id].record_id,
+            version=by_id[item.snapshot_id].version,
+            position=item.position,
+            status=_snapshot_status(by_id[item.snapshot_id]),
+            withdrawn_at=by_id[item.snapshot_id].withdrawn_at,
+        )
+        for item in frozen_items
+    ]
+    payload = _rotation_payload(
+        kind=ROTATION_KIND_BUNDLE,
+        request_id=request_id,
+        old_credential=old_credential,
+        new_credential=new_bundle.credential,
+        snapshot_ids=snapshot_ids,
+        expires_at=bundle.expires_at,
+        max_reads=bundle.max_reads,
+        reads_used=bundle.reads_used,
+        rotated_at=rotated_at,
+        items=response_items,
+    )
+    db.add(
+        CredentialRotation(
+            kind=ROTATION_KIND_BUNDLE,
+            old_credential=old_credential,
+            new_credential=new_bundle.credential,
+            request_id=request_id,
+            response_payload=payload.model_dump(mode="json"),
+        )
+    )
+    db.commit()
+    return payload
+
+
+@app.post(
+    "/credentials/rotate",
+    response_model=CredentialRotationResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def rotate_credential(
+    payload: CredentialRotateRequest, db: Session = Depends(get_db)
+):
+    """读取凭证疑似泄露时换发：单快照令牌或多快照共享凭证同一入口。
+
+    维护人员凭服务密钥提交（原凭证, 请求标识）：
+    - 仅未撤销、未到期且额度未耗尽的凭证可换发；新凭证继承原范围（适用快照/
+      冻结清单）、原绝对到期时刻与已用次数，旧凭证换发提交后不能再读取；
+    - 相同原凭证与请求标识重试 -> 原样返回首次换发结果（replayed=true），
+      不再次换发；不同请求标识并发/重复换发仅一次成功，其余 409；
+    - 换发与同时进行的成功读取按事务先后结算（快照行锁串行化），
+      不重置也不超支额度；
+    - 未知凭证 404；共享清单中个别快照已撤回仍可换发，该项继续不可读。
+    """
+    old_credential = payload.credential
+    request_id = payload.request_id
+    # 先以普通读定位凭证及其类型（随后在类型分支内按“先快照后凭证”顺序加锁）
+    read_token = db.execute(
+        select(ReadToken).where(ReadToken.token == old_credential)
+    ).scalar_one_or_none()
+    if read_token is not None:
+        return _rotate_token(db, read_token.snapshot_id, request_id, old_credential)
+    bundle = db.execute(
+        select(ReadBundle).where(ReadBundle.credential == old_credential)
+    ).scalar_one_or_none()
+    if bundle is not None:
+        return _rotate_bundle(db, bundle.id, request_id, old_credential)
+    db.rollback()
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND, detail="credential not found"
+    )
+
+
 @app.post(
     "/tokens/{token}/revoke",
     response_model=RevokeResponse,
@@ -1061,10 +1356,16 @@ def get_token_status(token: str, db: Session = Depends(get_db)):
         created_at=read_token.created_at,
         expires_at=read_token.expires_at,
         revoked_at=read_token.revoked_at,
+        rotated_at=read_token.rotated_at,
         max_reads=read_token.max_reads,
         reads_used=read_token.reads_used,
         remaining_reads=remaining,
-        active=read_token.revoked_at is None and not expired and not exhausted,
+        active=(
+            read_token.revoked_at is None
+            and read_token.rotated_at is None
+            and not expired
+            and not exhausted
+        ),
     )
 
 
@@ -1192,6 +1493,7 @@ def read_snapshot(
             ReadToken.token == token,
             ReadToken.snapshot_id == snapshot.id,
             ReadToken.revoked_at.is_(None),
+            ReadToken.rotated_at.is_(None),
             or_(ReadToken.expires_at.is_(None), ReadToken.expires_at > now),
             or_(
                 ReadToken.max_reads.is_(None),
@@ -1202,7 +1504,7 @@ def read_snapshot(
     )
     if not result.rowcount:
         # 不是有效的单快照令牌：按多快照共享凭证判定（凭证只能读取清单内快照）。
-        # 成员关系、撤销/到期/额度判定与共享计数递增合并为同一条条件 UPDATE，
+        # 成员关系、撤销/换发/到期/额度判定与共享计数递增合并为同一条条件 UPDATE，
         # 命中行即 reads_used = reads_used + 1：行锁串行化并发读取，
         # 跨清单的成功次数绝不超过共享上限。
         bundle_result = db.execute(
@@ -1210,6 +1512,7 @@ def read_snapshot(
             .where(
                 ReadBundle.credential == token,
                 ReadBundle.revoked_at.is_(None),
+                ReadBundle.rotated_at.is_(None),
                 or_(ReadBundle.expires_at.is_(None), ReadBundle.expires_at > now),
                 ReadBundle.reads_used < ReadBundle.max_reads,
                 ReadBundle.id.in_(
