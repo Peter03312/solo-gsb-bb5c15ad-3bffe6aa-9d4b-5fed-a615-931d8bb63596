@@ -272,3 +272,44 @@ class BundleRevokeResponse(BaseModel):
     bundle_id: UUID
     revoked: bool
     already_revoked: bool
+
+
+# ---- 凭证换发（疑似泄露时以旧换新） ----
+
+
+class CredentialRotateRequest(BaseModel):
+    """换发请求：凭服务密钥提交原凭证（单快照令牌或多快照共享凭证）与请求标识。
+
+    - credential：待换发的原凭证字符串，服务端自动识别令牌或共享凭证；
+    - request_id：维护人员生成的请求标识（UUID），作为幂等键：
+      相同原凭证 + 相同请求标识的重试返回首次换发结果，不再换发；
+      不同请求标识的并发换发只有一次成功，其余 409。
+    """
+
+    credential: str = Field(min_length=1, max_length=64)
+    request_id: UUID
+
+
+class CredentialRotateResponse(BaseModel):
+    """换发结果：新随机凭证 + 适用快照 + 原绝对到期时刻 + 继承的已用次数与剩余额度。"""
+
+    # 回显请求标识，便于维护侧核对幂等
+    request_id: UUID
+    # token=单快照令牌换发；bundle=多快照共享凭证换发
+    kind: str
+    # 新随机凭证；旧凭证在换发提交后不能再读取
+    new_credential: str
+    # 适用快照：单快照令牌为单元素清单；共享凭证为继承的冻结清单（按提交顺序）
+    snapshot_ids: list[UUID]
+    # 原绝对到期时刻（新凭证原样继承；null 表示永不到期）
+    expires_at: datetime | None = None
+    # 原额度上限（继承不变；单快照令牌不限次时为 null）
+    max_reads: int | None = None
+    # 原已用次数（继承不变，不清零、不重置）
+    reads_used: int
+    # 剩余额度：max_reads - reads_used；不限次令牌为 null
+    remaining_reads: int | None = None
+    # kind=bundle 时返回共享凭证 ID；kind=token 时为 null
+    bundle_id: UUID | None = None
+    # kind=token 时返回所适用的单个快照；kind=bundle 时为 null
+    snapshot_id: UUID | None = None

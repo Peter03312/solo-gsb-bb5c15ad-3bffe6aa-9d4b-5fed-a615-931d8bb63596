@@ -299,3 +299,49 @@ class ReadBundleItem(Base):
     position: Mapped[int] = mapped_column(Integer, nullable=False)
 
     bundle: Mapped["ReadBundle"] = relationship(back_populates="items")
+
+
+class CredentialRotation(Base):
+    """凭证换发记录：同一 (凭证类型, 原凭证, 请求标识) 的换发至多一条。
+
+    - request_id 为维护人员指定的幂等标识，全局唯一：相同原凭证 + 相同请求标识
+      的重试直接回放首次结果（response_snapshot），不再换发；
+    - 换发成功在同一事务内停用旧凭证（写 revoked_at）、生成新凭证并落本记录，
+      行级唯一约束保证不同请求标识的并发换发恰好一次成功；
+    - 记录一经写入不可变，仅用于冲突判定与首次结果回放。
+    """
+
+    __tablename__ = "credential_rotations"
+    __table_args__ = (
+        UniqueConstraint("kind", "old_token", "request_id",
+                         name="uq_credential_rotations_token_request"),
+        UniqueConstraint("kind", "old_bundle_id", "request_id",
+                         name="uq_credential_rotations_bundle_request"),
+        CheckConstraint("kind IN ('token', 'bundle')", name="ck_credential_rotations_kind"),
+        CheckConstraint(
+            "(kind = 'token' AND old_token IS NOT NULL AND old_bundle_id IS NULL) OR "
+            "(kind = 'bundle' AND old_token IS NULL AND old_bundle_id IS NOT NULL)",
+            name="ck_credential_rotations_kind_exclusive",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # 维护人员指定的幂等标识；全局唯一，相同原凭证重试时据此回放首次结果
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    # 换发对象类型：token=单快照令牌，bundle=多快照共享凭证
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # 原凭证定位（按 kind 二选一，非空）：令牌以其主键 token 字符串定位，
+    # 共享凭证以 bundle 主键定位（凭证字符串另存在 response_snapshot 中）
+    old_token: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("read_tokens.token", ondelete="CASCADE"), nullable=True
+    )
+    old_bundle_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("read_bundles.id", ondelete="CASCADE"), nullable=True
+    )
+
+    # 首次换发响应的完整快照：重试时原样回放，不再次换发
+    response_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

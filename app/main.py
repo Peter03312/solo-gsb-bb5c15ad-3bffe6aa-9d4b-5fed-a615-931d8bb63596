@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from sqlalchemy import func, inspect, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, selectinload
 
 from .config import settings
@@ -19,6 +19,7 @@ from .models import (
     REQUEST_APPROVED,
     REQUEST_PENDING,
     REQUEST_REJECTED,
+    CredentialRotation,
     PublishRequest as PublishRequestModel,
     ReadBundle,
     ReadBundleItem,
@@ -41,6 +42,8 @@ from .schemas import (
     ControlledFlagResponse,
     ControlledPublishRequest,
     ControlledSubmitResponse,
+    CredentialRotateRequest,
+    CredentialRotateResponse,
     Interval,
     PublicSnapshotResponse,
     PublishRequest as PublishPayload,
@@ -152,8 +155,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.4.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证）",
+    version="1.5.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 凭证换发）",
     lifespan=lifespan,
 )
 
@@ -1030,6 +1033,250 @@ def revoke_token(token: str, db: Session = Depends(get_db)):
     if db.get(ReadToken, token) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="token not found")
     return RevokeResponse(token=token, revoked=True, already_revoked=True)
+
+
+def _rotation_conflict(detail: str) -> HTTPException:
+    """换发冲突统一 409：凭证不可换发或已被换发（含并发落选）。"""
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _token_rotation_payload(request_id, read_token: ReadToken) -> dict:
+    """构造单快照令牌的换发响应体（也是重试时回放的完整结果）。"""
+    remaining = (
+        None
+        if read_token.max_reads is None
+        else max(read_token.max_reads - read_token.reads_used, 0)
+    )
+    return {
+        "request_id": str(request_id),
+        "kind": "token",
+        "new_credential": "",  # 由调用方在生成随机凭证后填入
+        "snapshot_ids": [str(read_token.snapshot_id)],
+        "snapshot_id": str(read_token.snapshot_id),
+        "bundle_id": None,
+        "expires_at": read_token.expires_at.isoformat() if read_token.expires_at else None,
+        "max_reads": read_token.max_reads,
+        "reads_used": read_token.reads_used,
+        "remaining_reads": remaining,
+    }
+
+
+def _bundle_rotation_payload(request_id, bundle: ReadBundle, snapshot_ids: list[UUID]) -> dict:
+    """构造多快照共享凭证的换发响应体（也是重试时回放的完整结果）。"""
+    return {
+        "request_id": str(request_id),
+        "kind": "bundle",
+        "new_credential": "",  # 由调用方在生成随机凭证后填入
+        "snapshot_ids": [str(sid) for sid in snapshot_ids],
+        "snapshot_id": None,
+        "bundle_id": str(bundle.id),
+        "expires_at": bundle.expires_at.isoformat() if bundle.expires_at else None,
+        "max_reads": bundle.max_reads,
+        "reads_used": bundle.reads_used,
+        "remaining_reads": max(bundle.max_reads - bundle.reads_used, 0),
+    }
+
+
+@app.post(
+    "/credentials/rotate",
+    response_model=CredentialRotateResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def rotate_credential(payload: CredentialRotateRequest, db: Session = Depends(get_db)):
+    """凭证换发：凭服务密钥提交原凭证与请求标识，以旧换新。
+
+    - 原凭证自动识别：单快照令牌（read_tokens）或多快照共享凭证（read_bundles），
+      两者均无 -> 404；
+    - 仅**未撤销、未到期且额度未耗尽**的凭证可换发 -> 否则 409；
+    - 新凭证继承原范围（适用快照/清单）、原**绝对到期时刻**与**已用次数**
+      （剩余额度随之继承，不清零、不重置），新凭证为全新随机串；
+    - 旧凭证在换发事务提交后立即不能再读取（写 revoked_at，与维护撤销同字段）；
+    - 相同原凭证 + 相同请求标识重试 -> 原样返回首次换发结果，不再次换发；
+      不同请求标识并发换发同一凭证 -> 行锁串行化，恰好一次成功，其余 409；
+    - 共享清单中个别快照已撤回时仍可换发，该撤回项继续不可读（公开读取规则不变）；
+    - 与同时进行的成功读取按事务提交先后结算：读取先提交则其扣次对新凭证可见，
+      换发先提交则旧凭证的读取失败，不重置也不超支额度。
+    """
+    request_id = payload.request_id
+    now = datetime.now(timezone.utc)
+
+    # 先按既有公开读取的识别顺序（令牌优先）定位并锁定原凭证。
+    # 加锁顺序与公开读取一致（先快照行、后凭证行）：避免换发与并发读取因持锁
+    # 顺序相反而死锁。FOR UPDATE 使“换发/换发”“换发/读取”在同一凭证上按
+    # 提交先后串行化，事务先后决定扣次归属，不重置也不超支额度。
+    snapshot_lock = db.execute(
+        select(Snapshot.id)
+        .join(ReadToken, ReadToken.snapshot_id == Snapshot.id)
+        .where(ReadToken.token == payload.credential)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if snapshot_lock is not None:
+        # 快照行已锁（与公开读取、共享凭证换发共用同一快照锁顺序），再锁令牌行
+        read_token = db.execute(
+            select(ReadToken)
+            .where(ReadToken.token == payload.credential)
+            .with_for_update()
+        ).scalar_one()
+        rotation = db.execute(
+            select(CredentialRotation).where(
+                CredentialRotation.kind == "token",
+                CredentialRotation.old_token == read_token.token,
+                CredentialRotation.request_id == request_id,
+            )
+        ).scalar_one_or_none()
+        if rotation is not None:
+            # 相同原凭证 + 相同请求标识重试：回放首次结果，不再次换发
+            db.rollback()
+            return rotation.response_snapshot
+        # 已有换发记录（不同请求标识，含并发落榜者）：旧凭证已停用，不能再换发
+        prior = db.execute(
+            select(CredentialRotation.id).where(
+                CredentialRotation.kind == "token",
+                CredentialRotation.old_token == read_token.token,
+            )
+        ).first()
+        if prior is not None:
+            db.rollback()
+            raise _rotation_conflict("credential has already been rotated")
+        if read_token.revoked_at is not None:
+            db.rollback()
+            raise _rotation_conflict("credential has been revoked")
+        if read_token.expires_at is not None and read_token.expires_at <= now:
+            db.rollback()
+            raise _rotation_conflict("credential has expired")
+        if (
+            read_token.max_reads is not None
+            and read_token.reads_used >= read_token.max_reads
+        ):
+            db.rollback()
+            raise _rotation_conflict("credential read quota is exhausted")
+
+        # 新令牌继承快照、绝对到期时刻、额度上限与已用次数
+        new_token = ReadToken(
+            token=secrets.token_urlsafe(32),
+            snapshot_id=read_token.snapshot_id,
+            expires_at=read_token.expires_at,
+            max_reads=read_token.max_reads,
+            reads_used=read_token.reads_used,
+        )
+        db.add(new_token)
+        db.flush()  # 先让新凭证落库，再停用旧凭证并记录换发
+        read_token.revoked_at = now
+        response = _token_rotation_payload(request_id, read_token)
+        response["new_credential"] = new_token.token
+        db.add(
+            CredentialRotation(
+                request_id=request_id,
+                kind="token",
+                old_token=read_token.token,
+                response_snapshot=response,
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            # 并发换发以相同请求标识落库 / 请求标识与其他换发冲突：以首次结果为准
+            db.rollback()
+            raise _rotation_conflict("rotation request conflict") from None
+        return response
+
+    bundle = db.execute(
+        select(ReadBundle).where(ReadBundle.credential == payload.credential)
+    ).scalar_one_or_none()
+    if bundle is None:
+        # 既不是有效/失效令牌也不是共享凭证（随机串命名空间分离，无碰撞）
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="credential not found"
+        )
+
+    # 先按 position 取清单并按快照 ID 排序加锁（全局一致的加锁顺序避免多清单
+    # 交叉时的快照锁死锁），再锁凭证行——与公开读取的“快照行 -> 凭证行”顺序一致。
+    bundle_items = (
+        db.execute(select(ReadBundleItem).where(ReadBundleItem.bundle_id == bundle.id))
+        .scalars()
+        .all()
+    )
+    locked_snapshot_ids = sorted(item.snapshot_id for item in bundle_items)
+    if locked_snapshot_ids:
+        db.execute(
+            select(Snapshot.id)
+            .where(Snapshot.id.in_(locked_snapshot_ids))
+            .order_by(Snapshot.id)
+            .with_for_update()
+        ).scalars().all()
+    bundle = db.execute(
+        select(ReadBundle).where(ReadBundle.id == bundle.id).with_for_update()
+    ).scalar_one()
+
+    rotation = db.execute(
+        select(CredentialRotation).where(
+            CredentialRotation.kind == "bundle",
+            CredentialRotation.old_bundle_id == bundle.id,
+            CredentialRotation.request_id == request_id,
+        )
+    ).scalar_one_or_none()
+    if rotation is not None:
+        db.rollback()
+        return rotation.response_snapshot
+    prior = db.execute(
+        select(CredentialRotation.id).where(
+            CredentialRotation.kind == "bundle",
+            CredentialRotation.old_bundle_id == bundle.id,
+        )
+    ).first()
+    if prior is not None:
+        db.rollback()
+        raise _rotation_conflict("credential has already been rotated")
+    if bundle.revoked_at is not None:
+        db.rollback()
+        raise _rotation_conflict("credential has been revoked")
+    if bundle.expires_at is not None and bundle.expires_at <= now:
+        db.rollback()
+        raise _rotation_conflict("credential has expired")
+    if bundle.reads_used >= bundle.max_reads:
+        db.rollback()
+        raise _rotation_conflict("credential read quota is exhausted")
+
+    # 继承冻结清单（按提交顺序）；清单内个别快照已撤回不阻止换发，该项继续不可读
+    snapshot_ids = [
+        item.snapshot_id for item in sorted(bundle_items, key=lambda item: item.position)
+    ]
+
+    # 新共享凭证继承清单、绝对到期时刻、总额度与已用共享次数
+    new_bundle = ReadBundle(
+        credential=secrets.token_urlsafe(32),
+        max_reads=bundle.max_reads,
+        reads_used=bundle.reads_used,
+        expires_at=bundle.expires_at,
+    )
+    db.add(new_bundle)
+    db.flush()  # 取得 new_bundle.id 后复制清单项
+    for position, snapshot_id in enumerate(snapshot_ids):
+        db.add(
+            ReadBundleItem(
+                bundle_id=new_bundle.id,
+                snapshot_id=snapshot_id,
+                position=position,
+            )
+        )
+    bundle.revoked_at = now
+    response = _bundle_rotation_payload(request_id, bundle, snapshot_ids)
+    response["new_credential"] = new_bundle.credential
+    db.add(
+        CredentialRotation(
+            request_id=request_id,
+            kind="bundle",
+            old_bundle_id=bundle.id,
+            response_snapshot=response,
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise _rotation_conflict("rotation request conflict") from None
+    return response
 
 
 @app.get(
